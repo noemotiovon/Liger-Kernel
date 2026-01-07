@@ -14,6 +14,9 @@ To add a new operator:
 If __all__ is not defined, all public symbols will be auto-discovered.
 """
 
+from liger_kernel.ops.backends._ascend.ops.cross_entropy import LigerCrossEntropyFunction
+from liger_kernel.ops.backends._ascend.ops.cross_entropy import cross_entropy_backward
+from liger_kernel.ops.backends._ascend.ops.cross_entropy import cross_entropy_forward
 from liger_kernel.ops.backends._ascend.ops.geglu import LigerGELUMulFunction
 from liger_kernel.ops.backends._ascend.ops.geglu import geglu_backward
 from liger_kernel.ops.backends._ascend.ops.geglu import geglu_forward
@@ -25,6 +28,9 @@ from liger_kernel.ops.backends._ascend.ops.rope import rope_backward
 from liger_kernel.ops.backends._ascend.ops.rope import rope_forward
 
 __all__ = [
+    "LigerCrossEntropyFunction",
+    "cross_entropy_forward",
+    "cross_entropy_backward",
     "LigerGELUMulFunction",
     "geglu_forward",
     "geglu_backward",

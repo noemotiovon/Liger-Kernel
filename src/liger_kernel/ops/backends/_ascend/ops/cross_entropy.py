@@ -1,4 +1,9 @@
-import operator
+"""
+UB-aware Cross Entropy implementation for Ascend NPU.
+
+This is the NPU-specific implementation that uses UB Manager to automatically
+calculate MAX_FUSED_SIZE based on UB capacity constraints.
+"""
 
 from typing import Optional
 
@@ -6,21 +11,13 @@ import torch
 import triton
 import triton.language as tl
 
-from liger_kernel.ops.utils import compare_version
+
+# For NPU, use triton.language.math.tanh
+from triton.language.math import tanh
+
+from liger_kernel.ops.backends._ascend.ub_manager import compute_default_tiling_strategy
 from liger_kernel.ops.utils import element_mul_kernel
 from liger_kernel.ops.utils import is_hip
-from liger_kernel.utils import infer_device
-from liger_kernel.utils import is_npu_available
-
-if compare_version("triton", operator.ge, "3.0.0") and not is_npu_available():
-    try:
-        # typical import path with dispatch available
-        from triton.language.extra.libdevice import tanh
-    except ModuleNotFoundError:
-        # for working with NGC containers
-        from triton.language.extra.cuda.libdevice import tanh
-else:
-    from triton.language.math import tanh
 
 
 @triton.jit
@@ -292,11 +289,9 @@ def liger_cross_entropy_kernel(
 # The hard limit of TRITON_MAX_TENSOR_NUMEL is 1048576 https://github.com/triton-lang/triton/blob/ba42a5c68fd0505f8c42f4202d53be0f8d9a5fe0/python/triton/language/core.py#L19
 # However, setting limit as 65536 as in LayerNorm tutorial is faster because of less register spilling
 # The optimal maximum block size depends on your hardware, your kernel, and your dtype
-# the best size we found by manually tuning on xpu.
-if infer_device() == "xpu":
-    MAX_FUSED_SIZE = 4096
-else:
-    MAX_FUSED_SIZE = 65536 // 2
+# For NPU, MAX_FUSED_SIZE will be calculated dynamically using UB Manager based on UB capacity.
+# This is a fallback value used when UB Manager is not available or calculation fails.
+MAX_FUSED_SIZE = 2048
 
 
 def cross_entropy_forward(
@@ -319,7 +314,26 @@ def cross_entropy_forward(
     BT, V = _input.shape
     n_rows = BT
 
-    BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(V))
+    has_gradients = _input.requires_grad
+    if not has_gradients:
+        memory_multiplier = 4.0
+    else:
+        memory_multiplier = 10.0
+
+    tile_shapes = compute_default_tiling_strategy(
+        safety_margin=0.80,
+        dtype_size=4,  # Use float32 size since kernel uses float32 for most buffers
+        memory_multiplier=memory_multiplier,
+        shapes=((V,),),
+        tiling_dims=(0,),
+    )
+    if tile_shapes is not None and len(tile_shapes) > 0 and len(tile_shapes[0]) > 0:
+        max_fused_size = tile_shapes[0][0]
+    else:
+        max_fused_size = MAX_FUSED_SIZE  # Fallback to default value
+
+    # Use max_fused_size calculated by UB Manager instead of hardcoded 2048
+    BLOCK_SIZE = min(max_fused_size, triton.next_power_of_2(V))
 
     # unreduced loss
     loss_1d = torch.zeros(n_rows, dtype=_input.dtype, device=_input.device)
@@ -413,7 +427,49 @@ def cross_entropy_backward(_input, grad_output):
     else:
         BT, V = _input.shape
         n_rows = BT
-        BLOCK_SIZE = min(MAX_FUSED_SIZE, triton.next_power_of_2(V))
+
+        # Calculate MAX_FUSED_SIZE using UB Manager for NPU
+        # Detailed memory analysis for cross_entropy backward (element_mul_kernel):
+        #
+        # The backward pass uses element_mul_kernel (utils.py, lines 96-130):
+        #   - Line 123: grad_output = tl.load(grad_output_ptr) - scalar, negligible
+        #   - Line 128: X_block = tl.load(X_ptr + X_offsets, ...) - loads BLOCK_SIZE * dtype_size bytes
+        #   - Line 129: tl.store(..., X_block * grad_output, ...) - computes and stores in-place
+        #
+        # Peak memory analysis (line 129 execution):
+        #   - X_block (input buffer): BLOCK_SIZE * dtype_size bytes (loaded at line 128)
+        #   - Computation buffer: BLOCK_SIZE * dtype_size bytes (worst case if compiler doesn't optimize)
+        #     - Even if compiler optimizes to in-place, we need to account for:
+        #       * Register spillage during computation
+        #       * Multiple warps executing simultaneously (32 warps * BLOCK_SIZE elements)
+        #       * Triton internal overhead (temporary variables, masks, etc.)
+        #
+        # Conservative estimate:
+        #   - Base: X_block input buffer = BLOCK_SIZE * dtype_size
+        #   - Computation overhead: ~1.0x for worst-case scenarios
+        #   - Triton internal overhead: ~1.0x for masks, registers, multiple warps, etc.
+        #   - Total: ~3.0x base memory
+        #
+        # We use memory_multiplier=3.0 for safety, accounting for:
+        #   1. Input buffer (X_block): 1.0x
+        #   2. Computation temporary (worst case): 1.0x
+        #   3. Other overhead (masks, registers, multiple warps): 1.0x
+        #   Total: 3.0x
+        dtype_size = _input.element_size()
+        tile_shapes = compute_default_tiling_strategy(
+            safety_margin=0.80,
+            dtype_size=dtype_size,
+            memory_multiplier=3.0,
+            shapes=((V,),),
+            tiling_dims=(0,),
+        )
+        if tile_shapes is not None and len(tile_shapes) > 0 and len(tile_shapes[0]) > 0:
+            max_fused_size = tile_shapes[0][0]
+        else:
+            max_fused_size = MAX_FUSED_SIZE  # Fallback to default value
+
+        # Use max_fused_size calculated by UB Manager instead of hardcoded 2048
+        BLOCK_SIZE = min(max_fused_size, triton.next_power_of_2(V))
 
         element_mul_kernel[(n_rows,)](
             _input,
